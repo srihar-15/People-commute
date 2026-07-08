@@ -2,6 +2,7 @@ import numpy as np
 from sqlalchemy.orm import Session
 from app.models.knowledge import KnowledgeDocument
 from app.services.ai import ai_service
+from app.services.ai.shared_ai import DEFAULT_MODEL
 from typing import List, Dict, Any
 
 def retrieve_context(db: Session, query: str, limit: int = 3, category_filter: str = None) -> List[Dict[str, Any]]:
@@ -77,7 +78,8 @@ def generate_policy_response(db: Session, query: str, limit: int = 3) -> Dict[st
     if ai_service.client:
         try:
             response = ai_service.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=DEFAULT_MODEL,
+                max_tokens=800,
                 messages=[
                     {
                         "role": "system", 

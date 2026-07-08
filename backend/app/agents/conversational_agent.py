@@ -2,8 +2,7 @@ import json
 from typing import TypedDict, List, Dict, Optional, Any
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-import google.generativeai as genai
-from app.services.ai.shared_ai import ai_service
+from app.services.ai.shared_ai import ai_service, DEFAULT_MODEL
 
 class CitizenChatState(TypedDict):
     user_id: str
@@ -22,16 +21,14 @@ class CitizenChatState(TypedDict):
 def determine_completeness(state: CitizenChatState) -> CitizenChatState:
     messages = state["messages"]
     
-    # Run Gemini Flash model for extraction
+    # Run OpenRouter model for extraction
     if ai_service.client_enabled:
         try:
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            
             # Format chat history for prompt
             history_str = ""
             for msg in messages:
                 history_str += f"{msg['role'].upper()}: {msg['content']}\n"
-                
+
             prompt = (
                 "You are an intake bot for a government grievance portal. "
                 "Review the conversation history and extract the following variables in JSON format. "
@@ -47,12 +44,14 @@ def determine_completeness(state: CitizenChatState) -> CitizenChatState:
                 f"{history_str}\n\n"
                 "Return only the JSON object."
             )
-            
-            response = model.generate_content(
-                prompt,
-                generation_config={"response_mime_type": "application/json"}
+
+            response = ai_service.client.chat.completions.create(
+                model=DEFAULT_MODEL,
+                max_tokens=500,
+                response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": prompt}],
             )
-            data = json.loads(response.text.strip())
+            data = json.loads(response.choices[0].message.content.strip())
             
             # Merge extracted state
             state["category"] = data.get("category") or state.get("category")
@@ -88,12 +87,10 @@ def ask_followup(state: CitizenChatState) -> CitizenChatState:
         
     if ai_service.client_enabled:
         try:
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            
             history_str = ""
             for msg in state["messages"]:
                 history_str += f"{msg['role'].upper()}: {msg['content']}\n"
-                
+
             prompt = (
                 "You are an official Govt of Andhra Pradesh grievance bot. "
                 "Based on the conversation history below, draft a single, polite, professional follow-up question "
@@ -102,8 +99,12 @@ def ask_followup(state: CitizenChatState) -> CitizenChatState:
                 "If the citizen has not uploaded a photo, politely remind them they can upload a photo of the defect.\n\n"
                 f"Conversation history:\n{history_str}\n"
             )
-            response = model.generate_content(prompt)
-            state["followup_question"] = response.text.strip()
+            response = ai_service.client.chat.completions.create(
+                model=DEFAULT_MODEL,
+                max_tokens=300,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            state["followup_question"] = response.choices[0].message.content.strip()
         except Exception as e:
             print(f"Error in ask_followup node: {e}")
             state["followup_question"] = "Could you please tell me the exact location or landmark near the issue?"

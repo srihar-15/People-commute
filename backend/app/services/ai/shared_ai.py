@@ -1,52 +1,56 @@
 import os
+import json
+import base64
 import random
 import requests
-from io import BytesIO
-from PIL import Image
 import numpy as np
-import google.generativeai as genai
+from openai import OpenAI
 from app.core.config import settings
 
 class AIServiceError(Exception):
     pass
 
+# All calls are routed through OpenRouter's OpenAI-compatible API.
+DEFAULT_MODEL = "google/gemini-2.5-flash"
+EMBEDDING_MODEL = "openai/text-embedding-3-small"
+
 class SharedAIService:
     def __init__(self):
-        # Fallback sequence for api keys
-        self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY") or settings.OPENAI_API_KEY
+        self.api_key = os.getenv("OPENROUTER_API_KEY") or settings.OPENROUTER_API_KEY
+        self.client = None
         self.client_enabled = False
-        
+
         if self.api_key and self.api_key != "mock-key":
             try:
-                genai.configure(api_key=self.api_key)
+                self.client = OpenAI(
+                    api_key=self.api_key,
+                    base_url="https://openrouter.ai/api/v1",
+                )
                 self.client_enabled = True
-                print("Google Generative AI successfully configured.")
+                print("OpenRouter client successfully configured.")
             except Exception as e:
-                print(f"Warning: Failed to initialize Google GenAI SDK: {e}")
-                
+                print(f"Warning: Failed to initialize OpenRouter client: {e}")
+
     def get_embeddings(self, text: str) -> list:
         """
-        Generates 1536-dimension text embeddings using Gemini.
+        Generates 1536-dimension text embeddings via OpenRouter.
         Pads or truncates output to 1536 dimensions for schema compatibility.
         """
         if self.client_enabled:
             try:
-                response = genai.embed_content(
-                    model="models/text-embedding-004",
-                    content=text,
-                    task_type="retrieval_document"
+                response = self.client.embeddings.create(
+                    model=EMBEDDING_MODEL,
+                    input=text,
                 )
-                raw_emb = response['embedding']
-                # Models output different dims. text-embedding-004 is 768.
-                # Let's pad or project to 1536 for DB schema compatibility.
+                raw_emb = list(response.data[0].embedding)
                 if len(raw_emb) < 1536:
                     raw_emb = raw_emb + [0.0] * (1536 - len(raw_emb))
                 elif len(raw_emb) > 1536:
                     raw_emb = raw_emb[:1536]
                 return raw_emb
             except Exception as e:
-                print(f"Gemini embedding failed, falling back: {e}")
-        
+                print(f"OpenRouter embedding failed, falling back: {e}")
+
         # Fallback: Deterministic embedding based on hash
         random.seed(hash(text) % 123456789)
         vector = [random.uniform(-0.1, 0.1) for _ in range(1536)]
@@ -55,24 +59,26 @@ class SharedAIService:
 
     def transcribe_audio(self, audio_bytes: bytes) -> str:
         """
-        Transcribes audio data (WhatsApp voice notes) using Gemini Multimodal.
+        Transcribes audio data (WhatsApp voice notes) via an OpenRouter audio-capable model.
         """
         if self.client_enabled:
             try:
-                model = genai.GenerativeModel("gemini-2.5-flash")
-                # Construct inline audio data
-                audio_part = {
-                    "mime_type": "audio/ogg", # WhatsApp default codec
-                    "data": audio_bytes
-                }
-                response = model.generate_content([
-                    audio_part,
-                    "Transcribe this voice note directly to English text. Do not add metadata or preamble."
-                ])
-                return response.text.strip()
+                b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+                response = self.client.chat.completions.create(
+                    model=DEFAULT_MODEL,
+                    max_tokens=500,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Transcribe this voice note directly to English text. Do not add metadata or preamble."},
+                            {"type": "input_audio", "input_audio": {"data": b64_audio, "format": "wav"}},
+                        ],
+                    }],
+                )
+                return response.choices[0].message.content.strip()
             except Exception as e:
-                print(f"Gemini voice note transcription failed: {e}")
-                
+                print(f"OpenRouter voice note transcription failed: {e}")
+
         # Fallback: Realistic mock transcription for demo
         transcriptions = [
             "There is a leakage in the water pipeline near my house, please fix it.",
@@ -83,18 +89,22 @@ class SharedAIService:
 
     def translate_text(self, text: str, target_lang: str = "en") -> str:
         """
-        Translates regional languages (Telugu, Hindi, etc.) using Gemini.
+        Translates regional languages (Telugu, Hindi, etc.) via OpenRouter.
         """
         if self.client_enabled:
             try:
-                model = genai.GenerativeModel("gemini-2.5-flash")
-                response = model.generate_content(
-                    f"Translate the following text directly to {target_lang}. Return only the translated text, nothing else:\n\n{text}"
+                response = self.client.chat.completions.create(
+                    model=DEFAULT_MODEL,
+                    max_tokens=500,
+                    messages=[{
+                        "role": "user",
+                        "content": f"Translate the following text directly to {target_lang}. Return only the translated text, nothing else:\n\n{text}",
+                    }],
                 )
-                return response.text.strip()
+                return response.choices[0].message.content.strip()
             except Exception as e:
-                print(f"Gemini translation failed: {e}")
-                
+                print(f"OpenRouter translation failed: {e}")
+
         # Mock translation fallback
         lower_text = text.lower()
         if "నీరు" in lower_text or "లీక్" in lower_text or "पानी" in lower_text:
@@ -105,58 +115,72 @@ class SharedAIService:
             return "Garbage bin is overflowing and stinking."
         return text
 
+    def _download_image_as_data_uri(self, image_url: str) -> str:
+        resp = requests.get(image_url, timeout=15)
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
+        b64_data = base64.b64encode(resp.content).decode("utf-8")
+        return f"data:{content_type};base64,{b64_data}"
+
     def perform_ocr(self, image_url: str) -> str:
         """
-        Extracts text from uploaded documents using Gemini Vision capabilities.
+        Extracts text from uploaded documents using OpenRouter vision-capable models.
         """
         if self.client_enabled:
             try:
-                model = genai.GenerativeModel("gemini-2.5-flash")
-                img_data = requests.get(image_url).content
-                img = Image.open(BytesIO(img_data))
-                response = model.generate_content([
-                    img,
-                    "Extract all readable text from this document image. Return only the extracted text, no explanations."
-                ])
-                return response.text.strip()
+                data_uri = self._download_image_as_data_uri(image_url)
+                response = self.client.chat.completions.create(
+                    model=DEFAULT_MODEL,
+                    max_tokens=1024,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Extract all readable text from this document image. Return only the extracted text, no explanations."},
+                            {"type": "image_url", "image_url": {"url": data_uri}},
+                        ],
+                    }],
+                )
+                return response.choices[0].message.content.strip()
             except Exception as e:
-                print(f"Gemini OCR failed: {e}")
-                
+                print(f"OpenRouter OCR failed: {e}")
+
         # Mock OCR fallback
         return "REPRESENTATIVE PETITION DOCUMENT\nSubject: Grievance regarding drinking water shortage.\nWard: Ward 5 Shastri Nagar.\nSignature: Sitha Devi"
 
     def verify_images(self, intake_image_url: str, resolution_image_url: str) -> dict:
         """
-        Performs structural before-and-after validation using Gemini Vision.
+        Performs structural before-and-after validation using OpenRouter vision-capable models.
         """
         if self.client_enabled:
             try:
-                model = genai.GenerativeModel("gemini-2.5-flash")
-                
-                # Retrieve images
-                img1_data = requests.get(intake_image_url).content
-                img1 = Image.open(BytesIO(img1_data))
-                
-                img2_data = requests.get(resolution_image_url).content
-                img2 = Image.open(BytesIO(img2_data))
-                
+                before_uri = self._download_image_as_data_uri(intake_image_url)
+                after_uri = self._download_image_as_data_uri(resolution_image_url)
+
                 prompt = (
                     "You are a quality assurance inspector. Compare the intake (before) image and the resolution (after) image. "
                     "Verify if the issue depicted in the before image has been resolved in the after image. "
-                    "Provide your response in JSON format containing: "
+                    "Respond with a JSON object containing: "
                     "'is_verified' (boolean), 'match_confidence' (float between 0 and 1), 'remarks' (string), "
                     "and 'verification_checklist' (array of strings checking validation details)."
                 )
-                
-                response = model.generate_content(
-                    [img1, img2, prompt],
-                    generation_config={"response_mime_type": "application/json"}
+
+                response = self.client.chat.completions.create(
+                    model=DEFAULT_MODEL,
+                    max_tokens=600,
+                    response_format={"type": "json_object"},
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": before_uri}},
+                            {"type": "image_url", "image_url": {"url": after_uri}},
+                        ],
+                    }],
                 )
-                import json
-                return json.loads(response.text.strip())
+                return json.loads(response.choices[0].message.content.strip())
             except Exception as e:
-                print(f"Gemini Vision verification failed: {e}")
-                
+                print(f"OpenRouter vision verification failed: {e}")
+
         # Mock Vision verification fallback
         return {
             "is_verified": True,
